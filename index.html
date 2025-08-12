@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Downtime OCR — Prototype</title>
+    <style>
+      :root {
+        font-family: system-ui, Segoe UI, Roboto, Helvetica, Arial;
+      }
+      body {
+        max-width: 980px;
+        margin: 18px auto;
+        padding: 18px;
+        color: #111;
+        background: #fafafa;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+      h1 {
+        font-size: 20px;
+        margin: 0;
+      }
+      .controls {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        margin: 12px 0;
+      }
+      select,
+      input[type="file"] {
+        padding: 8px;
+        border-radius: 8px;
+        border: 1px solid #ddd;
+      }
+      button {
+        padding: 8px 12px;
+        border-radius: 8px;
+        border: 0;
+        background: #111;
+        color: #fff;
+        cursor: pointer;
+      }
+      button.secondary {
+        background: #777;
+      }
+      #preview {
+        max-width: 320px;
+        border: 1px solid #ddd;
+        padding: 6px;
+        border-radius: 6px;
+        margin-top: 8px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 14px;
+      }
+      th,
+      td {
+        border: 1px solid #e2e2e2;
+        padding: 8px;
+        text-align: left;
+      }
+      th {
+        background: #f2f2f2;
+      }
+      .status {
+        font-size: 13px;
+        color: #555;
+      }
+      .small {
+        font-size: 13px;
+        color: #666;
+      }
+      .actions {
+        display: flex;
+        gap: 8px;
+        margin-top: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Downtime OCR — Simple Prototype</h1>
+      <div class="small">
+        (HTML + JavaScript, client-side OCR using Tesseract.js)
+      </div>
+    </header>
+
+    <p class="small">
+      Select machine, capture (or upload) photo. The app will OCR the image and
+      try to fill fields into the row for that machine. Edit the results if
+      needed, then <strong>Save</strong> or <strong>Download CSV</strong>.
+    </p>
+
+    <div class="controls">
+      <label for="machine">Machine:</label>
+      <select id="machine">
+        <option value="ML1">ML1</option>
+        <option value="ML2">ML2</option>
+        <option value="ML3">ML3</option>
+        <option value="ML4">ML4</option>
+        <option value="ML5">ML5</option>
+        <option value="ML6">ML6</option>
+        <option value="ML7">ML7</option>
+        <option value="ML8">ML8</option>
+      </select>
+
+      <!-- using input file with capture makes it easy to open camera on phones -->
+      <input
+        id="fileInput"
+        type="file"
+        accept="image/*"
+        capture="environment"
+      />
+
+      <button id="processBtn">Process Image</button>
+      <button id="saveBtn" class="secondary">Save Row</button>
+      <button id="downloadBtn">Download CSV</button>
+    </div>
+
+    <div>
+      <div id="previewWrap">
+        <img id="preview" alt="preview" src="" style="display: none" />
+      </div>
+      <div class="status" id="status">
+        Model will load on first OCR run (downloads model ~ few MBs).
+      </div>
+    </div>
+
+    <h3>OCR Raw Output</h3>
+    <pre
+      id="rawOutput"
+      style="
+        background: #fff;
+        border: 1px solid #eee;
+        padding: 8px;
+        border-radius: 6px;
+        min-height: 60px;
+      "
+    ></pre>
+
+    <h3>Editable Table (one row per captured record)</h3>
+    <table id="recordsTable">
+      <thead>
+        <tr>
+          <th>Machine</th>
+          <th>Down Time</th>
+          <th>Reason</th>
+          <th>Occurrence</th>
+          <th>Operator Name</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+
+    <div class="actions">
+      <button id="clearBtn" class="secondary">Clear All</button>
+      <div class="small">
+        Saved locally in your browser (localStorage). You can later migrate to a
+        real DB/server.
+      </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@2/dist/tesseract.min.js"></script>
+    <script>
+      // Simple client-side prototype using Tesseract.js and localStorage as "DB"
+      const fileInput = document.getElementById("fileInput");
+      const preview = document.getElementById("preview");
+      const previewWrap = document.getElementById("previewWrap");
+      const processBtn = document.getElementById("processBtn");
+      const status = document.getElementById("status");
+      const rawOutput = document.getElementById("rawOutput");
+      const machineSelect = document.getElementById("machine");
+      const recordsTable = document.querySelector("#recordsTable tbody");
+      const saveBtn = document.getElementById("saveBtn");
+      const downloadBtn = document.getElementById("downloadBtn");
+      const clearBtn = document.getElementById("clearBtn");
+
+      // Storage key
+      const STORAGE_KEY = "downtime_records_v1";
+
+      // In-memory current record
+      let currentImageDataUrl = null;
+      let currentOCRText = "";
+
+      // Load saved records
+      function loadRecords() {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        return raw ? JSON.parse(raw) : [];
+      }
+      function saveRecords(arr) {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(arr));
+      }
+
+      function renderTable() {
+        const rows = loadRecords();
+        recordsTable.innerHTML = "";
+        rows.forEach((r, idx) => {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+          <td><input data-field="machine" value="${escapeHtml(r.machine)}"></td>
+          <td><input data-field="downtime" value="${escapeHtml(
+            r.downtime
+          )}"></td>
+          <td><input data-field="reason" value="${escapeHtml(r.reason)}"></td>
+          <td><input data-field="occurrence" value="${escapeHtml(
+            r.occurrence
+          )}"></td>
+          <td><input data-field="operator" value="${escapeHtml(
+            r.operator
+          )}"></td>
+          <td><button data-idx="${idx}" class="deleteBtn">Delete</button></td>
+        `;
+          recordsTable.appendChild(tr);
+        });
+
+        // attach delete handlers
+        document.querySelectorAll(".deleteBtn").forEach((btn) => {
+          btn.onclick = () => {
+            const idx = Number(btn.getAttribute("data-idx"));
+            const arr = loadRecords();
+            arr.splice(idx, 1);
+            saveRecords(arr);
+            renderTable();
+          };
+        });
+
+        // attach input change handlers to update storage live
+        recordsTable.querySelectorAll("input").forEach((inp) => {
+          inp.onchange = () => {
+            const tr = inp.closest("tr");
+            const inputs = tr.querySelectorAll("input");
+            const idx = Array.from(recordsTable.children).indexOf(tr);
+            const arr = loadRecords();
+            if (!arr[idx]) return;
+            arr[idx] = {
+              machine: inputs[0].value,
+              downtime: inputs[1].value,
+              reason: inputs[2].value,
+              occurrence: inputs[3].value,
+              operator: inputs[4].value,
+            };
+            saveRecords(arr);
+          };
+        });
+      }
+
+      function escapeHtml(s) {
+        if (!s) return "";
+        return s
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;");
+      }
+
+      // CSV download
+      function downloadCSV() {
+        const rows = loadRecords();
+        if (rows.length === 0) {
+          alert("No records to download");
+          return;
+        }
+        const header = [
+          "Machine",
+          "Down Time",
+          "Reason",
+          "Occurrence",
+          "Operator Name",
+        ];
+        const csv = [header.join(",")];
+        for (const r of rows) {
+          const line = [
+            r.machine,
+            r.downtime,
+            r.reason,
+            r.occurrence,
+            r.operator,
+          ]
+            .map((v) => `"${(v || "").replaceAll('"', '""')}"`)
+            .join(",");
+          csv.push(line);
+        }
+        const blob = new Blob([csv.join("\n")], { type: "text/csv" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "downtime_records.csv";
+        a.click();
+        URL.revokeObjectURL(url);
+      }
+
+      // Simple heuristics parser: tries to map OCR lines to fields
+      function parseOCR(text) {
+        const lines = text
+          .split(/\r?\n/)
+          .map((s) => s.trim())
+          .filter(Boolean);
+        const joined = lines.join(" | ");
+
+        // Heuristics
+        let downtime = "";
+        let occurrence = "";
+        let operator = "";
+        let reason = "";
+
+        // 1) find typical time expressions: 12:34 or 5 min or 10 mins or 2 hrs
+        const timeRe =
+          /\b\d{1,2}:\d{2}\b|\b\d+\s*(?:mins?|minutes?|min|hrs?|hours?|h)\b/gi;
+        const timeMatch = joined.match(timeRe);
+        if (timeMatch) downtime = timeMatch[0];
+
+        // 2) find single small integers for occurrence, or 'x3', or 'times'
+        const occRe =
+          /(?:x|×)?\s*(\d{1,3})\b|\b(\d{1,3})\s*(?:times|occurrence|occurrences)\b/gi;
+        let occM;
+        while ((occM = occRe.exec(joined)) !== null) {
+          const g = occM[1] || occM[2];
+          if (g && Number(g) > 0) {
+            occurrence = g;
+            break;
+          }
+        }
+
+        // 3) operator name -> look for lines with 2 words (capitalized) or the last non-numeric line
+        for (const l of lines.slice().reverse()) {
+          if (/[A-Za-z]/.test(l) && !/\d/.test(l) && l.split(" ").length <= 4) {
+            // prefer this as operator if looks like a name
+            operator = l;
+            break;
+          }
+        }
+
+        // 4) reason -> any leftover long text that isn't time/number/name
+        // choose first reasonably long line that is not downtime and not operator
+        for (const l of lines) {
+          if (downtime && l.includes(downtime)) continue;
+          if (operator && l === operator) continue;
+          if (/^[\d\s:.-]+$/.test(l)) continue; // only numbers/symbols
+          // first candidate
+          reason = l;
+          break;
+        }
+
+        // Fallback: if nothing parsed, put full raw into reason
+        if (!downtime && !operator && !reason && !occurrence) {
+          reason = joined;
+        }
+
+        return { downtime, reason, occurrence, operator };
+      }
+
+      // Tesseract worker lazy init
+      let worker = null;
+      async function initWorker() {
+        if (worker) return worker;
+        status.textContent =
+          "Loading Tesseract model (first-time). This may take a few seconds...";
+        worker = Tesseract.createWorker({
+          logger: (m) => {
+            // show progress messages
+            if (m.status && m.progress != null) {
+              status.textContent = `${m.status} ${(m.progress * 100).toFixed(
+                0
+              )}%`;
+            }
+          },
+        });
+        await worker.load();
+        await worker.loadLanguage("eng");
+        await worker.initialize("eng");
+        status.textContent = "Model loaded. Ready.";
+        return worker;
+      }
+
+      // Main image -> OCR flow
+      processBtn.onclick = async () => {
+        const file = fileInput.files[0];
+        if (!file) {
+          alert("Choose or capture an image first");
+          return;
+        }
+        // show preview
+        const url = URL.createObjectURL(file);
+        preview.src = url;
+        preview.style.display = "block";
+        currentImageDataUrl = url;
+
+        // init worker and run
+        await initWorker();
+        status.textContent = "Recognizing...";
+        try {
+          const { data } = await worker.recognize(file);
+          currentOCRText = data.text || "";
+          rawOutput.textContent = currentOCRText;
+          status.textContent = "Recognition complete. Parsing...";
+          const parsed = parseOCR(currentOCRText);
+          // create a row with selected machine and parsed fields
+          const rec = {
+            machine: machineSelect.value,
+            downtime: parsed.downtime,
+            reason: parsed.reason,
+            occurrence: parsed.occurrence,
+            operator: parsed.operator,
+          };
+          // save to storage append
+          const arr = loadRecords();
+          arr.push(rec);
+          saveRecords(arr);
+          renderTable();
+          status.textContent =
+            "Parsed and appended to table. Edit if needed and click Save Row to persist.";
+        } catch (e) {
+          console.error(e);
+          status.textContent = "Error during OCR: " + (e.message || e);
+        }
+      };
+
+      // Save row: this will take current OCR and append (if user edited raw fields, they are already saved live via renderTable inputs onchange)
+      saveBtn.onclick = () => {
+        // parse last OCR and append if not already
+        if (!currentOCRText) {
+          alert("No OCR text to save. Capture and process an image first.");
+          return;
+        }
+        const parsed = parseOCR(currentOCRText);
+        const rec = {
+          machine: machineSelect.value,
+          downtime: parsed.downtime,
+          reason: parsed.reason,
+          occurrence: parsed.occurrence,
+          operator: parsed.operator,
+        };
+        const arr = loadRecords();
+        arr.push(rec);
+        saveRecords(arr);
+        renderTable();
+      };
+
+      downloadBtn.onclick = () => downloadCSV();
+      clearBtn.onclick = () => {
+        if (!confirm("Clear all saved records?")) return;
+        localStorage.removeItem(STORAGE_KEY);
+        renderTable();
+      };
+
+      // initial render
+      renderTable();
+    </script>
+  </body>
+</html>
